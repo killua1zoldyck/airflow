@@ -68,7 +68,8 @@ function autoTailingLog(tryNumber, metadata = null, autoTailing = false) {
   console.debug(
     `Auto-tailing log for dag_id: ${dagId}, task_id: ${taskId}, ` +
       `execution_date: ${executionDate}, map_index: ${mapIndex}, try_number: ${tryNumber}, ` +
-      `metadata: ${JSON.stringify(metadata)}`
+      `metadata: ${JSON.stringify(metadata)} ` +
+      `logsWithMetadataUrl: ${logsWithMetadataUrl}`
   );
 
   return Promise.resolve(
@@ -157,11 +158,17 @@ function autoTailingLog(tryNumber, metadata = null, autoTailing = false) {
       }
     }
 
+    
     if (res.metadata.end_of_log) {
       document.getElementById(`loading-${tryNumber}`).style.display = "none";
       return;
     }
-    recurse().then(() => autoTailingLog(tryNumber, res.metadata, autoTailing));
+    
+    if (res.metadata.immediate_tail) {
+      recurse(0).then(() => autoTailingLog(tryNumber, res.metadata, autoTailing));
+    } else {
+      recurse().then(() => autoTailingLog(tryNumber, res.metadata, autoTailing));
+    }
   });
 }
 

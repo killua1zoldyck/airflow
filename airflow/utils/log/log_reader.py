@@ -59,6 +59,7 @@ class TaskLogReader:
         contain information about the task log which can enable you read logs to the
         end.
         """
+        print("Anirudh In log_reader.read_log_chunks")
         logs, metadatas = self.log_handler.read(ti, try_number, metadata=metadata)
         metadata = metadatas[0]
         return logs, metadata

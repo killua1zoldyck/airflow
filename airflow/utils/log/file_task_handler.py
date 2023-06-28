@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 from urllib.parse import urljoin
 
 import pendulum
+import heapq
 
 from airflow.configuration import conf
 from airflow.exceptions import RemovedInAirflow3Warning
@@ -119,18 +120,48 @@ def _parse_timestamps_in_log_file(lines: Iterable[str]):
         yield timestamp, idx, line
 
 
-def _interleave_logs(*logs):
+def _parse_and_sort_logs(log_type, *logs):
     records = []
+    print("Ending error", log_type, logs)
     for log in logs:
-        records.extend(_parse_timestamps_in_log_file(log.splitlines()))
-    last = None
-    for _, _, v in sorted(
-        records, key=lambda x: (x[0], x[1]) if x[0] else (pendulum.datetime(2000, 1, 1), x[1])
-    ):
-        if v != last:  # dedupe
-            yield v
-        last = v
+        records.extend(_parse_timestamps_in_log_file(log.splitlines()) + (log_type, "",))
+    return sorted(records, key=lambda x: (x[0], x[1]) if x[0] else (pendulum.datetime(2000, 1, 1), x[1]))
 
+def _parse_and_sort_streaming_logs(log_type, *logs):
+    records = []
+    if not logs:
+        return records
+    print("Anirudh Logs", type(logs), logs)
+    for idx, log in enumerate(logs[0]):
+        print("Type of log[1]", type(log[1]), log[1])
+        timestamp = _parse_timestamp(log[1])
+        records.append((timestamp, idx, log[1], log_type, log[0], ))
+    return sorted(records, key=lambda x: (x[0], x[1]) if x[0] else (pendulum.datetime(2000, 1, 1), x[1])) 
+
+def _k_way_merge(
+    sorted_local_logs,
+    sorted_remote_logs,
+    sorted_executor_logs,
+    sorted_served_logs,
+    metadata
+):
+    sorted_merged_log = []
+    
+    for _, _, log, log_type, file in heapq.merge(
+        sorted_local_logs,
+        sorted_remote_logs,
+        sorted_executor_logs,
+        sorted_served_logs,
+        key=lambda x : x[0]
+    ):
+        sorted_merged_log.append(log)
+        if file == "":
+            metadata[log_type]["log_pos"] += 1
+        else:
+            metadata[log_type][file]["need"] += 1
+            if(metadata[log_type][file]["need"] == 50):
+                return sorted_merged_log
+    return sorted_merged_log
 
 class FileTaskHandler(logging.Handler):
     """
@@ -300,6 +331,7 @@ class FileTaskHandler(logging.Handler):
         # Task instance here might be different from task instance when
         # initializing the handler. Thus explicitly getting log location
         # is needed to get correct log path.
+        print("Anirudh In file_task_handler._read")
         worker_log_rel_path = self._render_filename(ti, try_number)
         messages_list: list[str] = []
         remote_logs: list[str] = []
@@ -307,6 +339,14 @@ class FileTaskHandler(logging.Handler):
         executor_messages: list[str] = []
         executor_logs: list[str] = []
         served_logs: list[str] = []
+        LOG_TYPES = ("remote_logs", "local_logs", "executor_logs", "served_logs")
+        STREAMING_LOG_TYPES = ("local_logs")
+        if not metadata:
+            for log_type in LOG_TYPES:
+                metadata[log_type]={}
+                if log_type not in STREAMING_LOG_TYPES:
+                    metadata[log_type]["log_pos"]=0
+
         with suppress(NotImplementedError):
             remote_messages, remote_logs = self._read_remote_logs(ti, try_number, metadata)
             messages_list.extend(remote_messages)
@@ -319,34 +359,57 @@ class FileTaskHandler(logging.Handler):
         if not (remote_logs and ti.state not in State.unfinished):
             # when finished, if we have remote logs, no need to check local
             worker_log_full_path = Path(self.local_base, worker_log_rel_path)
-            local_messages, local_logs = self._read_from_local(worker_log_full_path)
+            local_messages, local_logs = self._read_from_local(worker_log_full_path, local_metadata=metadata["local_logs"])
             messages_list.extend(local_messages)
         if ti.state in (TaskInstanceState.RUNNING, TaskInstanceState.DEFERRED) and not executor_messages:
             served_messages, served_logs = self._read_from_logs_server(ti, worker_log_rel_path)
             messages_list.extend(served_messages)
-        elif ti.state not in State.unfinished and not (local_logs or remote_logs):
+        elif ti.state not in State.unfinished and not (local_logs or remote_logs) and "end_of_log" not in metadata:
             # ordinarily we don't check served logs, with the assumption that users set up
             # remote logging or shared drive for logs for persistence, but that's not always true
             # so even if task is done, if no local logs or remote logs are found, we'll check the worker
             served_messages, served_logs = self._read_from_logs_server(ti, worker_log_rel_path)
             messages_list.extend(served_messages)
 
+        # logs = "\n".join(
+        #     _interleave_logs(
+        #         metadata,
+        #         *local_logs,
+        #         *remote_logs,
+        #         *(executor_logs or []),
+        #         *served_logs,
+        #     )
+        # )
+        
+        sorted_local_logs = _parse_and_sort_streaming_logs("local_logs", *local_logs)
+        sorted_remote_logs = _parse_and_sort_logs("remote_logs", *remote_logs)
+        sorted_executor_logs = _parse_and_sort_logs("executor_logs", *executor_logs)
+        sorted_served_logs = _parse_and_sort_logs("served_logs", *served_logs)
+        
+        print("Length of sorted_local_logs", len(sorted_local_logs))
+        
+        # Cut off previously passed log test as new tail
+        sorted_remote_logs = sorted_remote_logs[metadata["remote_logs"]["log_pos"]:]
+        sorted_executor_logs = sorted_executor_logs[metadata["executor_logs"]["log_pos"]:]
+        sorted_served_logs = sorted_served_logs[metadata["served_logs"]["log_pos"]:]
+        
         logs = "\n".join(
-            _interleave_logs(
-                *local_logs,
-                *remote_logs,
-                *(executor_logs or []),
-                *served_logs,
+            _k_way_merge(
+                sorted_local_logs,
+                sorted_remote_logs,
+                sorted_executor_logs,
+                sorted_served_logs,
+                metadata
             )
         )
-        log_pos = len(logs)
+        if logs:
+            logs = "\n" + logs
         messages = "".join([f"*** {x}\n" for x in messages_list])
-        end_of_log = ti.try_number != try_number or ti.state not in [State.RUNNING, State.DEFERRED]
-        if metadata and "log_pos" in metadata:
-            previous_chars = metadata["log_pos"]
-            logs = logs[previous_chars:]  # Cut off previously passed log test as new tail
-        out_message = logs if "log_pos" in (metadata or {}) else messages + logs
-        return out_message, {"end_of_log": end_of_log, "log_pos": log_pos}
+        out_message = logs if "end_of_log" in metadata else messages + logs
+        metadata["end_of_log"] = (ti.try_number != try_number or ti.state not in [State.RUNNING, State.DEFERRED]) and (len(logs) == 0)
+        metadata["immediate_tail"] = (ti.try_number != try_number or ti.state not in [State.RUNNING, State.DEFERRED]) and (len(logs) != 0)
+        print("Length of log Anirudh", len(logs))
+        return out_message, metadata
 
     @staticmethod
     def _get_pod_namespace(ti: TaskInstance):
@@ -393,6 +456,7 @@ class FileTaskHandler(logging.Handler):
         # So the log for a particular task try will only show up when
         # try number gets incremented in DB, i.e logs produced the time
         # after cli run and before try_number + 1 in DB will not be displayed.
+        print("Anirudh In file_task_handler.read")
         if try_number is None:
             next_try = task_instance.next_try_number
             try_numbers = list(range(1, next_try))
@@ -486,14 +550,50 @@ class FileTaskHandler(logging.Handler):
         return full_path
 
     @staticmethod
-    def _read_from_local(worker_log_path: Path) -> tuple[list[str], list[str]]:
+    def _read_from_local(
+        worker_log_path: Path, 
+        local_metadata: dict[str, Any] | None = None
+    ) -> tuple[list[str], list[list[tuple[str, str]]]]:
         messages = []
         logs = []
-        files = list(worker_log_path.parent.glob(worker_log_path.name + "*"))
-        if files:
-            messages.extend(["Found local files:", *[f"  * {x}" for x in sorted(files)]])
-        for file in sorted(files):
-            logs.append(Path(file).read_text())
+        print("Anirudh In file_task_handler._read_from_local")
+        if not local_metadata:
+            files = list(worker_log_path.parent.glob(worker_log_path.name + "*"))
+            if files:
+                messages.extend(["Found local files:", *[f"  * {x}" for x in sorted(files)]])
+            for file in sorted(files):
+                with open(Path(file), 'r') as f:
+                    chunk = []
+                    for _ in range(50):
+                        line = f.readline().rstrip()
+                        if not line:
+                            local_metadata[str(file)]["need"] = 0
+                            local_metadata[str(file)]["done"] = True
+                            break
+                        chunk.append((str(file), line))
+                    local_metadata[str(file)]={"lines": len(chunk), "prev_position": f.tell(), "need": 0, "done": (len(chunk) != 50)}
+                    logs.append(chunk)
+                    print("If : Chunk size", len(chunk))
+        else:
+            print("Does it come to else")
+            for file in local_metadata:
+                if not local_metadata[file]["done"]:
+                    with open(Path(file), 'r') as f:
+                        f.seek(local_metadata[str(file)]["prev_position"])
+                        chunk = []
+                        for _ in range(local_metadata[str(file)]["need"]):
+                            line = f.readline().rstrip()
+                            if not line:
+                                print("Why does it come here?", _)
+                                local_metadata[str(file)]["need"] = 0
+                                local_metadata[str(file)]["done"] = True
+                                break
+                            chunk.append((str(file), line))
+                        local_metadata[str(file)]["lines"] += len(chunk)
+                        local_metadata[str(file)]["prev_position"] = f.tell()
+                        local_metadata[str(file)]["need"] = 0
+                        logs.append(chunk)
+                        print("Else : Chunk size", len(chunk))
         return messages, logs
 
     def _read_from_logs_server(self, ti, worker_log_rel_path) -> tuple[list[str], list[str]]:
